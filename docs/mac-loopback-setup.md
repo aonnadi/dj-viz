@@ -56,5 +56,8 @@ Switch your Mac's output (and Rekordbox's) back to your normal speakers or the F
 | Meters don't move | Check that the source app is outputting to the Multi-Output Device, not directly to the speakers. |
 | No sound, but meters move | Your speakers aren't ticked in the Multi-Output Device. |
 | Dropdown shows "Audio input" with no names | Pick any entry once and allow access. The real names appear after that. |
+| Dropdown only shows "Audio: off" and "System default input" | The browser isn't listing inputs. Use Chrome (not Safari, and turn off Brave Shields if using Brave), then reload. Picking "System default input" just uses the Mac's default input, which is usually the built-in mic. |
+| BlackHole isn't in the list, but other inputs are | Fully quit Chrome (⌘Q) and reopen it; if that doesn't help, restart the Mac. Check Audio MIDI Setup shows "BlackHole 2ch" as a device. |
+| Quick workaround | System Settings → Sound → **Input** → BlackHole 2ch, then pick "System default input" in dj-viz. |
 | "Click anywhere to start audio" | Chrome needs one click or keypress before audio can start. |
 | Audio crackles or drifts out of sync | Make sure Drift Correction is ticked for BlackHole 2ch. |

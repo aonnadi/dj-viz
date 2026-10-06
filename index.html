@@ -218,17 +218,37 @@ function audioMsg(msg, cls = 'dim') { $('audioMsg').textContent = msg; $('audioM
 const A = { bass: 0, mid: 0, high: 0, kick: 0, energy: 0 };
 let audio = null;
 
+async function getInputs() {
+  try { return (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId); }
+  catch { return []; }
+}
+
 async function listInputs(selectId) {
   const sel = $('audioSel');
   const want = selectId ?? sel.value;
-  let devs = [];
-  try { devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId); } catch {}
+  let devs = await getInputs();
+  // Some browsers fill in the device list a moment after access is granted.
+  if (audio && !devs.length) { await new Promise(r => setTimeout(r, 400)); devs = await getInputs(); }
+  const track = audio?.stream.getAudioTracks()[0];
+  const curId = track?.getSettings().deviceId;
   let opts = '<option value="">Audio: off</option>';
   if (!devs.length) opts += '<option value="default">System default input</option>';
   opts += devs.map(d => `<option value="${esc(d.deviceId)}">${esc(d.label || 'Audio input')}</option>`).join('');
+  // Always show the input we're actually listening to, even if the browser didn't list it.
+  if (curId && !devs.some(d => d.deviceId === curId))
+    opts += `<option value="${esc(curId)}">${esc(track.label || 'Current input')}</option>`;
   if (devs.length && !devs.some(d => d.label)) opts += '<option disabled>(pick one to allow access and see names)</option>';
   sel.innerHTML = opts;
-  sel.value = [...sel.options].some(o => o.value === want) ? want : (audio ? sel.value : '');
+  const has = v => v && [...sel.options].some(o => o.value === v);
+  sel.value = has(want) ? want : has(curId) ? curId : (audio ? 'default' : '');
+  if (audio && !sel.value) sel.value = 'default';
+  return devs;
+}
+
+function inputHint(devs) {
+  if (!devs.length) return ' — browser is hiding the input list (use Chrome, and see docs/mac-loopback-setup.md troubleshooting)';
+  if (!devs.some(d => /blackhole/i.test(d.label))) return ' — BlackHole not found: quit & reopen Chrome (or restart the Mac) after installing it';
+  return '';
 }
 
 function stopAudio() {
@@ -260,9 +280,10 @@ async function startAudio(id) {
               peak: { bass: 0.3, mid: 0.3, high: 0.3 }, prevBass: 0, fluxAvg: 0, lastKick: 0 };
     track.onended = () => { stopAudio(); listInputs(''); audioMsg('Input disconnected.', 'warn'); };
     store.set(AUDIO_KEY, realId);
-    await listInputs(realId);
+    const devs = await listInputs(realId);
+    const hint = /blackhole/i.test(track.label) ? '' : inputHint(devs);
     if (ctx.state === 'suspended') audioMsg('Click anywhere to start audio', 'warn');
-    else audioMsg('listening: ' + (track.label || 'input'), 'ok');
+    else audioMsg('listening: ' + (track.label || 'input') + hint, hint ? 'warn' : 'ok');
   } catch (err) {
     audioMsg('Audio input failed: ' + err.message, 'warn');
     await listInputs('');
