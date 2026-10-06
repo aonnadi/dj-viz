@@ -16,6 +16,14 @@
   .ok { color: #7dffa8; } .warn { color: #ffcc66; } .dim { color: #8f8f8f; } .un { color: #ff7a7a; }
   #log div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   kbd { border: 1px solid #555; border-radius: 3px; padding: 0 4px; font-size: 11px; }
+  #audioRow { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #audioSel { background: #111; color: #e8e8e8; border: 1px solid #444; border-radius: 4px;
+    font: inherit; padding: 2px 4px; max-width: 280px; }
+  #meters { margin-top: 4px; display: flex; gap: 10px; align-items: center; }
+  .m { display: inline-flex; align-items: center; gap: 4px; }
+  .m i { display: inline-block; width: 46px; height: 6px; background: #2a2a2a; border-radius: 3px; overflow: hidden; }
+  .m i b { display: block; height: 100%; width: 0; background: #7dffa8; }
+  #mK b { background: #ff7ad1; }
 </style>
 </head>
 <body>
@@ -23,11 +31,21 @@
 <div id="hud">
   <h1>DDJ-FLX4 → VISUALS</h1>
   <div id="status" class="warn">Requesting MIDI access…</div>
-  <div id="vals" class="dim"></div>
+  <div id="audioRow">
+    <select id="audioSel" title="Audio input the visuals listen to"><option value="">Audio: off</option></select>
+    <span id="audioMsg" class="dim"></span>
+  </div>
+  <div id="meters" class="dim">
+    <span class="m">bass <i id="mB"><b></b></i></span>
+    <span class="m">mid <i id="mM"><b></b></i></span>
+    <span class="m">high <i id="mH"><b></b></i></span>
+    <span class="m">kick <i id="mK"><b></b></i></span>
+  </div>
+  <div id="vals" class="dim" style="margin-top:4px"></div>
   <div style="margin-top:6px">Last MIDI messages <span class="dim">(red = unmapped)</span>:</div>
   <div id="log" class="dim">—</div>
   <div class="dim" style="margin-top:8px">
-    <kbd>H</kbd> hide HUD · <kbd>F</kbd> fullscreen · <kbd>M</kbd> audio input on/off<br>
+    <kbd>H</kbd> hide HUD · <kbd>F</kbd> fullscreen · <kbd>M</kbd> audio on/off (last-used input)<br>
     No controller? drag = scratch deck A (<kbd>Shift</kbd>+drag = B) · <kbd>1</kbd>–<kbd>8</kbd> pads A (<kbd>Shift</kbd> = B)<br>
     <kbd>Z</kbd>/<kbd>X</kbd> crossfader · <kbd>Q</kbd>/<kbd>A</kbd> bass A · <kbd>W</kbd>/<kbd>S</kbd> bass B ·
     <kbd>Space</kbd>/<kbd>Enter</kbd> toggle play A/B (also resyncs if out of step)
@@ -90,7 +108,7 @@ const newDeck = () => ({
   scr: 0,            // smoothed scratch velocity (signed)
   low: .5, mid: .5, high: .5, fader: 1, filter: 0, tempo: .5,
 });
-const S = { deck: [newDeck(), newDeck()], xfade: .5, bursts: [], audio: 0, flash: 0 };
+const S = { deck: [newDeck(), newDeck()], xfade: .5, bursts: [], flash: 0 };
 
 function handle(ev, val) {               // val is the raw 0–127 data byte
   const d = S.deck[ev.deck];
@@ -179,34 +197,136 @@ async function initMidi() {
 }
 
 // =====================================================================
-// 4. OPTIONAL AUDIO INPUT  (press M) — bass energy makes visuals breathe
+// 4. AUDIO INPUT — the music itself drives the visuals
+// ---------------------------------------------------------------------
+// Pick any input from the dropdown: the Mac mic, BlackHole (loopback),
+// or a USB audio interface fed from a mixer output. The code doesn't care
+// which — it just listens. Levels are auto-normalised, so a quiet mic
+// and a hot line input both give full-range movement.
+//   A.bass / A.mid / A.high : 0–1 band levels (smoothed)
+//   A.kick                  : 1 on each detected kick, decays to 0
+//   A.energy                : slow overall loudness (builds vs. breakdowns)
 // =====================================================================
+const AUDIO_KEY = 'djviz.audioInput';
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function audioMsg(msg, cls = 'dim') { $('audioMsg').textContent = msg; $('audioMsg').className = cls; }
+
+const A = { bass: 0, mid: 0, high: 0, kick: 0, energy: 0 };
 let audio = null;
-async function toggleAudio() {
-  if (audio) {
-    audio.stream.getTracks().forEach(t => t.stop()); audio.ctx.close(); audio = null; S.audio = 0; return;
-  }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-    const ctx = new AudioContext();
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.4;
-    ctx.createMediaStreamSource(stream).connect(analyser);
-    audio = { stream, ctx, analyser, buf: new Uint8Array(analyser.frequencyBinCount),
-              binHz: ctx.sampleRate / analyser.fftSize, avg: 0 };
-  } catch (err) { status('Audio input failed: ' + err.message, 'warn'); }
+
+async function listInputs(selectId) {
+  const sel = $('audioSel');
+  const want = selectId ?? sel.value;
+  let devs = [];
+  try { devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId); } catch {}
+  let opts = '<option value="">Audio: off</option>';
+  if (!devs.length) opts += '<option value="default">System default input</option>';
+  opts += devs.map(d => `<option value="${esc(d.deviceId)}">${esc(d.label || 'Audio input')}</option>`).join('');
+  if (devs.length && !devs.some(d => d.label)) opts += '<option disabled>(pick one to allow access and see names)</option>';
+  sel.innerHTML = opts;
+  sel.value = [...sel.options].some(o => o.value === want) ? want : (audio ? sel.value : '');
 }
-function updateAudio() {
+
+function stopAudio() {
   if (!audio) return;
-  const { analyser, buf, binHz } = audio;
-  analyser.getByteFrequencyData(buf);
-  const lo = Math.max(1, Math.floor(30 / binHz)), hi = Math.ceil(150 / binHz);
-  let sum = 0; for (let i = lo; i <= hi; i++) sum += buf[i];
-  const e = sum / ((hi - lo + 1) * 255);
-  audio.avg = audio.avg * 0.97 + e * 0.03;
-  const kick = Math.min(1, Math.max(0, (e - audio.avg * 1.05) * 5));
-  S.audio = Math.max(S.audio * 0.88, kick);            // fast attack, slow release
+  audio.stream.getTracks().forEach(t => { t.onended = null; t.stop(); });
+  audio.ctx.close();
+  audio = null;
+  Object.keys(A).forEach(k => A[k] = 0);
+}
+
+async function startAudio(id) {
+  stopAudio();
+  store.set(AUDIO_KEY, id || '');
+  if (!id) { audioMsg(''); $('audioSel').value = ''; return; }
+  if (!navigator.mediaDevices?.getUserMedia) { audioMsg('Audio input not supported in this browser.', 'warn'); return; }
+  audioMsg('Opening input…');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      deviceId: id === 'default' ? undefined : { exact: id },
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    const ctx = new AudioContext({ latencyHint: 'interactive' });
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.3;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+    const track = stream.getAudioTracks()[0];
+    const realId = track.getSettings().deviceId || id;
+    audio = { stream, ctx, analyser, buf: new Uint8Array(analyser.frequencyBinCount),
+              binHz: ctx.sampleRate / analyser.fftSize,
+              peak: { bass: 0.3, mid: 0.3, high: 0.3 }, prevBass: 0, fluxAvg: 0, lastKick: 0 };
+    track.onended = () => { stopAudio(); listInputs(''); audioMsg('Input disconnected.', 'warn'); };
+    store.set(AUDIO_KEY, realId);
+    await listInputs(realId);
+    if (ctx.state === 'suspended') audioMsg('Click anywhere to start audio', 'warn');
+    else audioMsg('listening: ' + (track.label || 'input'), 'ok');
+  } catch (err) {
+    audioMsg('Audio input failed: ' + err.message, 'warn');
+    await listInputs('');
+  }
+}
+
+function resumeAudio() {
+  if (audio && audio.ctx.state === 'suspended') {
+    audio.ctx.resume().then(() => audioMsg('listening: ' + (audio?.stream.getAudioTracks()[0]?.label || 'input'), 'ok'));
+  }
+}
+addEventListener('pointerdown', resumeAudio);
+addEventListener('keydown', resumeAudio);
+
+function toggleAudio() {
+  if (audio) startAudio('');
+  else startAudio(store.get(AUDIO_KEY) || 'default');
+}
+
+function initAudio() {
+  $('audioSel').addEventListener('change', e => { startAudio(e.target.value); e.target.blur(); });
+  navigator.mediaDevices?.addEventListener?.('devicechange', () => listInputs());
+  listInputs('');
+  const saved = store.get(AUDIO_KEY);
+  if (saved) startAudio(saved);
+}
+
+function bandLevel(lo, hi) {               // average magnitude in a frequency range, 0–1
+  const { buf, binHz } = audio;
+  const a = Math.max(1, Math.floor(lo / binHz)), b = Math.min(buf.length - 1, Math.ceil(hi / binHz));
+  let s = 0; for (let i = a; i <= b; i++) s += buf[i];
+  return s / ((b - a + 1) * 255);
+}
+
+function updateAudio(dt, now) {
+  if (!audio || audio.ctx.state !== 'running') {
+    for (const k in A) A[k] = Math.max(0, A[k] - dt * 3);
+    return;
+  }
+  audio.analyser.getByteFrequencyData(audio.buf);
+  const raw = { bass: bandLevel(30, 150), mid: bandLevel(150, 2000), high: bandLevel(2000, 12000) };
+
+  // Auto-gain: each band is divided by its own recent peak (decays over ~6 s),
+  // with a noise gate so silence stays dark instead of amplifying hiss.
+  const norm = {};
+  for (const k in raw) {
+    const p = audio.peak;
+    p[k] = Math.max(raw[k], p[k] * Math.exp(-dt / 6), 0.08);
+    norm[k] = raw[k] < 0.04 ? 0 : Math.min(1, raw[k] / p[k]);
+  }
+  const ease = (cur, target, up, down) => cur + (target - cur) * Math.min(1, dt * (target > cur ? up : down));
+  A.bass = ease(A.bass, norm.bass, 30, 6);
+  A.mid  = ease(A.mid,  norm.mid,  20, 5);
+  A.high = ease(A.high, norm.high, 30, 8);
+  A.energy = ease(A.energy, norm.bass * 0.5 + norm.mid * 0.3 + norm.high * 0.2, 2, 0.6);
+
+  // Kick = a sudden jump in bass (spectral flux), well above its running average.
+  const flux = Math.max(0, raw.bass - audio.prevBass);
+  audio.prevBass = raw.bass;
+  audio.fluxAvg = audio.fluxAvg * 0.95 + flux * 0.05;
+  if (flux > audio.fluxAvg * 2.2 + 0.012 && norm.bass > 0.55 && now - audio.lastKick > 0.12) {
+    A.kick = 1; audio.lastKick = now;
+  }
+  A.kick = Math.max(0, A.kick - dt * 5);
 }
 
 // =====================================================================
@@ -224,6 +344,7 @@ addEventListener('pointerup', () => { if (drag) S.deck[drag.deck].touch = false;
 
 const held = new Set();
 addEventListener('keydown', e => {
+  if (e.target instanceof HTMLSelectElement) return;   // don't fire shortcuts while using the dropdown
   held.add(e.code);
   if (e.repeat) return;
   const c = e.code;
@@ -255,7 +376,7 @@ in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
 const FS = `#version 300 es
 precision highp float;
 uniform vec2  uRes;
-uniform float uTime, uX, uAudio, uFlash;
+uniform float uTime, uX, uKick, uEnergy, uAudioOn, uFlash;
 uniform vec4  uDeckA, uDeckB;   // phase, low EQ, channel fader, filter
 uniform vec4  uEq;              // midA, highA, midB, highB
 uniform vec2  uScr, uTouch;     // scratch velocity, platter touch amount
@@ -279,7 +400,7 @@ float sparkle(vec2 p, float high, float seed) {
 vec3 worldA(vec2 p) {
   float r = length(p) + 1e-4;
   float a = atan(p.y, p.x) + uScr.x * 0.7 / (r + 0.15);
-  float bass = uDeckA.y + uAudio * 0.6;
+  float bass = uDeckA.y + uKick * 0.6;
   float z = 0.4 / r + uDeckA.x;
   float f = abs(fract(z * 2.0) - 0.5);
   float w = 0.03 + 0.22 * bass * bass;
@@ -298,7 +419,7 @@ vec3 worldA(vec2 p) {
 // DECK B — perspective grid. Phase scrolls it; scratch tilts it; low EQ = line weight.
 vec3 worldB(vec2 p) {
   p = rot(uScr.y * 0.8) * p;
-  float bass = uDeckB.y + uAudio * 0.6;
+  float bass = uDeckB.y + uKick * 0.6;
   float y = abs(p.y) + 0.06;
   vec2 q = vec2(p.x / y, 1.0 / y + uDeckB.x * 2.0) * 0.5;
   vec2 g = abs(fract(q) - 0.5);
@@ -328,6 +449,7 @@ void main() {
   vec2 p = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
   float touch = mix(uTouch.x, uTouch.y, uX);
   p *= 1.0 + 0.08 * touch;                                 // "grabbing the record" pulls back
+  p *= 1.0 - 0.05 * uKick;                                 // kick punches the camera forward
 
   // Scratch → chromatic smear around the centre, direction follows the hand
   float scr = mix(uScr.x, uScr.y, uX);
@@ -342,6 +464,7 @@ void main() {
     float core = exp(-d * d * 60.0) * exp(-b.x * 8.0);
     col += hsv(b.w, 0.7, 1.0) * (ring * 1.4 + core * 2.0);
   }
+  col *= mix(1.0, 0.55 + 0.75 * uEnergy, uAudioOn);       // breakdowns dim, drops glow
   col += vec3(uFlash);
   col *= 1.0 - 0.35 * dot(p, p);                           // vignette
   col = 1.0 - exp(-col * 1.3);                             // soft tone map
@@ -367,7 +490,7 @@ function initGL() {
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
   const loc = gl.getAttribLocation(prog, 'p');
   gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-  for (const n of ['uRes', 'uTime', 'uX', 'uAudio', 'uFlash', 'uDeckA', 'uDeckB', 'uEq', 'uScr', 'uTouch', 'uBursts'])
+  for (const n of ['uRes', 'uTime', 'uX', 'uKick', 'uEnergy', 'uAudioOn', 'uFlash', 'uDeckA', 'uDeckB', 'uEq', 'uScr', 'uTouch', 'uBursts'])
     U[n] = gl.getUniformLocation(prog, n);
   return true;
 }
@@ -382,18 +505,23 @@ function resize() {
 // 7. MAIN LOOP
 // =====================================================================
 const burstBuf = new Float32Array(32);
+const [meterB, meterM, meterH, meterK] = ['mB', 'mM', 'mH', 'mK'].map(id => $(id).firstElementChild);
 let last = performance.now();
 
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
   const t = now / 1000;
   applyHeldKeys(dt);
-  updateAudio();
+  updateAudio(dt, t);
+  const on = audio ? 1 : 0;
 
   for (const d of S.deck) {
     const rate = 0.5 * (1 + (d.tempo - 0.5) * 0.3);
+    // With audio on, the music keeps things moving even if Play wasn't tracked;
+    // loud sections travel faster, breakdowns drift.
+    const drive = on ? (d.playing ? rate * (0.6 + 0.8 * A.energy) : 0.6 * A.energy) : (d.playing ? rate : 0);
     if (d.touch) d.phase += d.jog * 0.006;                 // hand on platter: you ARE the record
-    else d.phase += (d.playing ? rate * dt : 0) + d.jog * 0.002;
+    else d.phase += drive * dt + d.jog * 0.002;
     const target = Math.max(-3, Math.min(3, d.jog / (dt * 60) * 0.08));
     d.scr += (target - d.scr) * Math.min(1, dt * 18);      // smooth the jittery jog stream
     d.touchAmt += ((d.touch ? 1 : 0) - d.touchAmt) * Math.min(1, dt * 12);
@@ -406,17 +534,22 @@ function frame(now) {
   });
   S.flash = Math.max(0, S.flash - dt * 4);
 
-  const [A, B] = S.deck;
+  const [DA, DB] = S.deck;
+  // EQ knobs scale how much each audio band shows up — so killing the
+  // low EQ still kills the bass visuals even while the music drives them.
+  const mod = (knob, band) => on ? knob * (0.35 + 1.1 * band) : knob;
   gl.uniform2f(U.uRes, cv.width, cv.height);
   gl.uniform1f(U.uTime, t);
   gl.uniform1f(U.uX, S.xfade);
-  gl.uniform1f(U.uAudio, S.audio);
+  gl.uniform1f(U.uKick, A.kick);
+  gl.uniform1f(U.uEnergy, A.energy);
+  gl.uniform1f(U.uAudioOn, on);
   gl.uniform1f(U.uFlash, S.flash);
-  gl.uniform4f(U.uDeckA, A.phase, A.low, A.fader, A.filter);
-  gl.uniform4f(U.uDeckB, B.phase, B.low, B.fader, B.filter);
-  gl.uniform4f(U.uEq, A.mid, A.high, B.mid, B.high);
-  gl.uniform2f(U.uScr, A.scr, B.scr);
-  gl.uniform2f(U.uTouch, A.touchAmt, B.touchAmt);
+  gl.uniform4f(U.uDeckA, DA.phase, mod(DA.low, A.bass), DA.fader, DA.filter);
+  gl.uniform4f(U.uDeckB, DB.phase, mod(DB.low, A.bass), DB.fader, DB.filter);
+  gl.uniform4f(U.uEq, mod(DA.mid, A.mid), mod(DA.high, A.high), mod(DB.mid, A.mid), mod(DB.high, A.high));
+  gl.uniform2f(U.uScr, DA.scr, DB.scr);
+  gl.uniform2f(U.uTouch, DA.touchAmt, DB.touchAmt);
   gl.uniform4fv(U.uBursts, burstBuf);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -424,9 +557,10 @@ function frame(now) {
     renderLog();
     const f = v => v.toFixed(2);
     $('vals').textContent =
-      `xfade ${f(S.xfade)} | A ${A.playing ? '▶' : '■'} fader ${f(A.fader)} low ${f(A.low)} filt ${f(A.filter)} scr ${f(A.scr)}` +
-      ` | B ${B.playing ? '▶' : '■'} fader ${f(B.fader)} low ${f(B.low)} filt ${f(B.filter)} scr ${f(B.scr)}` +
-      (audio ? ` | audio ${f(S.audio)}` : '');
+      `xfade ${f(S.xfade)} | A ${DA.playing ? '▶' : '■'} fader ${f(DA.fader)} low ${f(DA.low)} filt ${f(DA.filter)} scr ${f(DA.scr)}` +
+      ` | B ${DB.playing ? '▶' : '■'} fader ${f(DB.fader)} low ${f(DB.low)} filt ${f(DB.filter)} scr ${f(DB.scr)}`;
+    meterB.style.width = (A.bass * 100) + '%'; meterM.style.width = (A.mid * 100) + '%';
+    meterH.style.width = (A.high * 100) + '%'; meterK.style.width = (A.kick * 100) + '%';
   }
   requestAnimationFrame(frame);
 }
@@ -435,6 +569,7 @@ try {
   if (initGL()) {
     resize(); addEventListener('resize', resize);
     initMidi();
+    initAudio();
     requestAnimationFrame(frame);
   }
 } catch (err) {
