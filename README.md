@@ -1,4 +1,4 @@
-# DJ Projections
+# dj-viz
 
 Live projected visuals driven by a **Pioneer DDJ-FLX4**. Scratching, the crossfader, EQs, filters and pads each trigger visuals that match the action, so the audience gets a visual show on top of the audio one.
 
